@@ -53,7 +53,7 @@ class Net(nn.Module):
         ## create a list of Activations
         self.acts = nn.ModuleList()
         for i in range(len(lins)):
-            self.acts.append(self.activation)
+            self.acts.append(self.activation())
         
         if dropout:
             self.drops = nn.ModuleList()
