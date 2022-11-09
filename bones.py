@@ -2,19 +2,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import optim
-import torch.nn.functional as F
-import datetime
 import pandas as pd
 import pickle
 import matplotlib.pyplot as plt
 import sys, os
 import warnings
-from torch.autograd import Function, Variable
-from torch.nn.parameter import Parameter
-from sigfig import round as siground
 import math
-
-
+import copy 
 
 class Net(nn.Module):
     def __init__(self, *args):
@@ -43,17 +37,16 @@ class Net(nn.Module):
 
         ## Create List of Linear Layers
         self.lfcs = nn.ModuleList()
-        if not lins[-1]==1:
-            lins.append(1)
         if lins:
             lins = np.append([lsize,], lins)
             for i in range(len(lins)-1):
                 self.lfcs.append( nn.Linear(lins[i], lins[i+1], ))
 
         ## create a list of Activations
-        self.acts = nn.ModuleList()
-        for i in range(len(lins)):
-            self.acts.append(self.activation())
+        if self.activation is not None:
+            self.acts = nn.ModuleList()
+            for i in range(len(lins)):
+                self.acts.append(self.activation())
         
         if dropout:
             self.drops = nn.ModuleList()
@@ -75,14 +68,15 @@ class Net(nn.Module):
                 else:
                     output = self.cfcs[i](output)
                      
-        #Create Embedding  
-        output = output.view(output.size()[0], -1)
-        output = torch.unsqueeze(output, 1)
+            #Create Embedding  
+            output = output.view(output.size()[0], -1)
+            output = torch.unsqueeze(output, 1)
                              
         #Run linear layers and activations
         for i in range(len(self.lfcs)):
             output = self.lfcs[i](output)
-            output = self.acts[i](output)
+            if self.activation is not None:
+                output = self.acts[i](output)
             if self.drops:
                 output = self.drops[i](output)
 
@@ -91,14 +85,15 @@ class Net(nn.Module):
     
 class Model:
     def __init__(self, *args, **kwargs):
-        self.lins, self.activation, optimizer,  self.batch_size, self.lr, self.indata, self.truth, self.cost =args
+        self.lins, self.activation, self.optim,  self.batch_size, self.lr, self.indata, self.truth, self.cost =args
         
         keys = ('convs', 'csizes','lr_decay', 'max_epochs', 'saving', 'run_num', 'new_tar',
-                'lr_min','dropout',  'plot_ev', 'print_ev', 'resnet', 'train_fac')
+                'lr_min','dropout',  'plot_ev', 'print_ev', 'resnet', 'train_fac', 'cov')
         for kwarg in kwargs.keys():
             if kwarg not in keys:
                 raise Exception(kwarg + ' is not a valid key. Valid keys: ', keys )
         
+        self.cov = kwargs.get('cov', 1)
         self.convs = kwargs.get('convs', [])
         self.csizes = kwargs.get('csizes', [])
         self.resnet = kwargs.get('resnet', False)
@@ -109,8 +104,8 @@ class Model:
             raise Exception('Provide the number of convolution channels and the size of the convolution matrix')
 
         
-        self.plotev = kwargs.get('plot_ev', 3)
-        self.printev = kwargs.get('print_ev', 1)
+        self.plotev = kwargs.get('plot_ev', 10)
+        self.printev = kwargs.get('print_ev', 10)
         self.train_fac = kwargs.get('train_fac', 4/5)
         
         
@@ -121,16 +116,15 @@ class Model:
 
                 
         self.dropout = kwargs.get('dropout', 0)
-    
-        self.model = Net(self.indata.shape[1:], self.convs, self.lins,  self.csizes, self.dropout, 
+        self.net = Net(self.indata.shape[1:], self.convs, self.lins,  self.csizes, self.dropout, 
                              self.resnet, self.activation).double()
         
         self.lr_decay = kwargs.get('lr_decay', 1)
         self.lr_min = kwargs.get('lr_min', 1e-10)
-        self.optimizer = optimizer(self.model.parameters(), lr = self.lr)
-        self.max_epochs = kwargs.get('max_epochs', 10)
+        self.optimizer = self.optim(self.net.parameters(), lr = self.lr)
+        self.max_epochs = kwargs.get('max_epochs', 20)
             
-        self.trainerr, self.testerr, self.err, self.epoch, self.loc, self.save_file = [], [], 0, 0, 0, None #just inits
+        self.trainerr, self.testerr, self.err, self.epoch, self.loc, self.save_file, self.loss = [], [], 0, 0, 0, None, 0 #just inits
         
         self.saving = kwargs.get('saving', False)
         
@@ -159,89 +153,24 @@ class Model:
         df = pd.DataFrame(columns = ('convolution layer sizes', 'convolution matrix sizes',  
                                       'ResNet','linear layer sizes','activation', 'training sample size', 'learning rate',  
                              'Dropout',  'batch size',   
-                            'epochs',  'derr', 'err', ))
-        vals = ( self.convs, self.csizes,  self.resnet , self.lins, str(self.activation),
+                            'epochs',  'testerr', 'trainerr', ))
+        vals = ( self.convs, self.csizes,  self.resnet , self.lins, str(self.activation).split('.')[-1][:-2],
                 int(self.train_fac*self.indata.shape[0]), self.lr, self.dropout,  self.batch_size,  
-                    self.epoch + len(self.testerr),  derr, round(float(self.err),2),)
+                    self.epoch + len(self.testerr),  round(float(self.loss), 2), round(float(self.err),2),)
         df.loc[self.loc] = vals
         if re == True:
             return df
         else: display(df)
-        
-                
-    def run(self, **kwargs):
-        if len(self.trainerr)!=len(self.testerr):
-            self.trainerr = self.trainerr[:-1]
-        keys = ('lr', 'lr_decay', 'max_epochs', 'saving', 'batch_size', 'lr_min', 'training',)
-        for kwarg in kwargs.keys():
-            if kwarg not in keys:
-                raise Exception(kwarg + ' is not a valid key. Valid keys: ', keys )
-                
-        train, traintruth, test, testtruth = self.data
-        self.testtruth = testtruth
-        self.max_epochs = kwargs.get('max_epochs', self.max_epochs)
-        self.lr = kwargs.get('lr', self.lr)
-        self.saving = kwargs.get('saving', self.saving)
-        self.lr_decay = kwargs.get('lr_decay', self.lr_decay)
-        self.batch_size = kwargs.get('batch_size', self.batch_size)
-        self.lr_min = kwargs.get('lr_min', self.lr_min)
-        training = kwargs.get('training', True)
-        self.printev = kwargs.get('print_ev', self.printev)
-        self.plotev = kwargs.get('plot_ev', self.plotev)
-        e0 = self.epoch
-        
-        while self.epoch < (e0 + self.max_epochs) :
-            shuffle = torch.randperm(len(traintruth)) #shuffle training set
-            self.lr = max(self.lr * self.lr_decay, self.lr_min)  #lr decay
-            for i in range(round(len(traintruth)/self.batch_size)):
-                self.optimizer.param_groups[0]['lr'] = self.lr
-                where = shuffle[i * self.batch_size:(i + 1) * self.batch_size] #take batch of training set
-                self.output = self.model(train[where])
-                self.truetrain = traintruth[where]
-                loss = torch.mean(self.cost(torch.squeeze(self.output), torch.tensor(traintruth[where]).double()))
-                if training:
-                    self.optimizer.zero_grad()
-                    loss.backward(retain_graph = True)
-                    self.optimizer.step()
-                         
-            self.trainerr.append(loss.detach().numpy())
-            self.testout = self.model(test)
-            self.err = self.cost(torch.squeeze(self.testout), torch.tensor(testtruth)
-                                         ).mean().detach().numpy()
-            self.testerr.append(self.err)
-            if not (self.epoch-e0) % self.plotev:
-                self.plot()
-                if not training:
-                    return []
-            #if it's not training, stop
-            l10 = self.testerr[-10:]
-            if len(self.testerr)>10 and np.all(np.abs(l10 - np.mean(l10))<.005*np.mean(l10)) and l10[-1]>l10[0]:
-                print('Not improving')
-                break
-            elif len(self.testerr)>10 and np.sum(l10[1:]>l10[:-1])>8:
-                print('Overfitting')
-                break
-            if not (self.epoch-e0) % self.printev:
-                print("Epoch number {}\n Current loss {}\n".format(self.epoch, self.err))
-            if self.saving:
-                self.save()
-            self.epoch += 1
             
-
-    def save(self): 
-        torch.save(self.model.state_dict(), self.save_file)
-        vals = pickle.load(open('values.p', 'rb'))
-        df = self.params()
-        if self.loc in vals.index.tolist():
-            vals.loc[self.loc] = df.loc[self.loc]
-        else:
-            vals = vals.append( df)
-        pickle.dump(vals, open('values.p', 'wb'))
-        
+            
     def check(self):
         
         df = self.params()
-        vals = pickle.load(open('values.p', 'rb'))
+        if os.path.exists('values.p'):
+            vals = pickle.load(open('values.p', 'rb'))
+        else:
+            vals = df
+            pickle.dump(vals, open('values.p', 'wb'))
         
         ## print warning and run params if current parameters match other runs
         same = np.array([])
@@ -257,11 +186,11 @@ class Model:
             
         # if saving to a new file, load weights. If continuing run, check that vals match
         if self.new_tar and type(self.run_num)==int:
-            self.model.load_state_dict(torch.load('tars/' + str(self.run_num)+'.tar'))        
+            self.net.load_state_dict(torch.load('tars/' + str(self.run_num)+'.tar'))        
         elif not self.new_tar and self.run_num:
             if vals.loc[self.run_num][:5].equals(df.loc[self.loc][:5]):
                 self.loc = self.run_num
-                self.model.load_state_dict(torch.load('tars/' + str(self.loc)+'.tar'))   
+                self.net.load_state_dict(torch.load('tars/' + str(self.loc)+'.tar'))   
             else: raise Exception('Parameters don\'t match')
 
                      
@@ -273,10 +202,115 @@ class Model:
             print('Not saving')
         else: 
             self.save_file = 'tars/' + str(self.loc)+'.tar'
+            
+    def save(self): 
+        torch.save(self.net.state_dict(), self.save_file)
+        vals = pickle.load(open('values.p', 'rb'))
+        df = self.params()
+        if self.loc in vals.index.tolist():
+            vals.loc[self.loc] = df.loc[self.loc]
+        else:
+            vals = vals.append( df)
+        pickle.dump(vals, open('values.p', 'wb'))
+        
   
+        
+                
+    def run(self, **kwargs):
+        if self.max_epochs ==self.epoch:
+            print('maximum epoch reached')
+        if len(self.trainerr)!=len(self.testerr):
+            self.trainerr = self.trainerr[:-1]
+        keys = ('lr', 'lr_decay', 'max_epochs', 'saving', 'batch_size', 'lr_min', 'training',)
+        for kwarg in kwargs.keys():
+            if kwarg not in keys:
+                raise Exception(kwarg + ' is not a valid key. Valid keys: ', keys )
+                
+        train, traintruth, traincov, test, testtruth, testcov = self.data
+        self.max_epochs = kwargs.get('max_epochs', self.max_epochs)
+        self.lr = kwargs.get('lr', self.lr)
+        self.saving = kwargs.get('saving', self.saving)
+        self.lr_decay = kwargs.get('lr_decay', self.lr_decay)
+        self.batch_size = kwargs.get('batch_size', self.batch_size)
+        self.lr_min = kwargs.get('lr_min', self.lr_min)
+        training = kwargs.get('training', True)
+        self.printev = kwargs.get('print_ev', self.printev)
+        self.plotev = kwargs.get('plot_ev', self.plotev)
+        e0 = self.epoch
+        self.batches = int(np.floor(traintruth.shape[0]/self.batch_size))
+        self.oldmodel = self.net.state_dict()
+        
+        while self.epoch + e0 < self.max_epochs:
+            shuffle = torch.randperm(len(traintruth)) #shuffle training set
+            self.lr = max(self.lr * self.lr_decay, self.lr_min)  #lr decay
+            self.loss = 0
+            for i in range(self.batches):
+                self.optimizer.param_groups[0]['lr'] = self.lr
+                where = shuffle[i * self.batch_size:(i + 1) * self.batch_size] #take batch of training set
+                self.output = self.net(train[where])
+                self.truetrain = traintruth[where]
+                if type(self.cov)== int:
+                    batchloss = torch.mean(self.cost(torch.squeeze(self.output), torch.tensor(traintruth[where]).double()))
+                else:
+                    batchloss = torch.mean(self.cost(torch.squeeze(self.output), torch.tensor(traintruth[where]).double(), traincov))
+                self.loss += batchloss/self.batches
+                    
+                if training: #turn off training to run without optimization
+                    self.optimizer.zero_grad()
+                    batchloss.backward(retain_graph = True)
+                    self.optimizer.step()
+                         
+            self.trainerr.append(self.loss.detach().numpy())
+            self.testout = self.net(test)
+            if type(self.cov) == int:
+                self.err = self.cost(torch.squeeze(self.testout), torch.tensor(testtruth)
+                                         ).mean().detach().numpy()
+            else:
+                self.err = self.cost(torch.squeeze(self.testout), torch.tensor(testtruth), testcov
+                                         ).mean().detach().numpy()
+            self.testerr.append(self.err)
+            if not (self.epoch-e0) % self.plotev and (testtruth.shape[-1] == 1 or len(testtruth.shape) == 1):
+                self.plot()
+            if not training:
+                return []
+
+            if not (self.epoch - e0) % self.printev:
+                print("Epoch number {}\n Current loss {}\n".format(self.epoch, self.err))
+                
+            t = 10
+            if not self.epoch%t or self.trainerr[-1]!=self.trainerr[-1]:   
+                self.checkpoint(t)
+                
+            if self.saving:
+                self.save()
+            self.epoch += 1
+    
+    def checkpoint(self, t = 10): 
+        if not self.epoch>t:
+            #create a checkpoint
+            self.oldmodel = copy.deepcopy(self.net.state_dict())#create a checkpoint to return to if training goes off the rails
+            self.oldlr = 1*self.lr
+            self.countcheck = 0
+        elif (self.trainerr[-1]/self.trainerr[-1 - t]>5) or (self.trainerr[-1]!=self.trainerr[-1]):
+            #return to checkpoint if necessary
+            print(f'Checkpoint: Reverting loss from  {round(float(model.trainerr[-1]), 3)} to {round(float(model.trainerr[-1 - t]), 3)}')
+            self.lr = 1* self.oldlr #revert lr   
+            self.net.load_state_dict(self.oldmodel) #revert weights
+            #remove record of bad epochs
+            self.testerr = self.testerr[:-t]  
+            self.trainerr = self.trainerr[:-t]
+            self.epoch -= t
+            self.optimizer = self.optim(self.net.parameters(), lr = self.lr) #delete adam's memory of the oopsie
+            self.countcheck+=1
+        else: 
+            #create a checkpoint
+            self.oldmodel = copy.deepcopy(self.net.state_dict())#create a checkpoint to return to if training goes off the rails
+            self.oldlr = 1*self.lr
+            self.countcheck = 0 
+       
             
     def plot(self, med = True,):
-        testtruth = self.data[-1]
+        testtruth = self.data[5]
         output = self.testout
         if len(self.testerr) > 1:
             fig, ax = plt.subplots(1,3, figsize = (15,4))
@@ -289,7 +323,7 @@ class Model:
             ax[2].set_yscale('log')
         else: fig, ax = plt.subplots(1, 2, figsize = (15, 4))
             
-        x, y = self.data[3], np.squeeze(np.squeeze(self.testout.detach().numpy()))
+        x, y = self.data[4], np.squeeze(np.squeeze(self.testout.detach().numpy()))
 
         ax[0].hist2d(x, y, bins = 30)
 
@@ -303,6 +337,9 @@ class Model:
         plt.show()
     
     def data_prep(self):
+        print(self.truth.shape)
+        if len(self.truth.shape)>1 and self.truth.shape[-1] > 1:
+            print('If your truth size is greater than 1, plotting will not work')
         data = torch.tensor(self.indata).double()
         
         if len(data.shape) == 1:
@@ -313,4 +350,13 @@ class Model:
         split = int(self.train_fac * self.truth.shape[0])
         train, traintruth = data[:split], self.truth[:split]
         test, testtruth = data[split:], self.truth[split:]
-        return train, traintruth, test, testtruth
+        if type(self.cov)!=int:
+            cov = torch.tensor(self.cov).double()
+            traincov = cov[:split]
+            testcov = cov[split:]
+        else:
+            traincov, testcov = 1, 1
+        return train, traintruth, traincov, test, testtruth, testcov
+
+            
+                            
